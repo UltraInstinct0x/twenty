@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from 'node:crypto';
+
 import { Injectable, Logger } from '@nestjs/common';
 
 import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
@@ -35,6 +37,107 @@ import { type AiEvaluationModel } from 'src/engine/metadata-modules/ai/ai-models
 import { type AiProviderConfig } from 'src/engine/metadata-modules/ai/ai-models/types/ai-provider-config.type';
 import { getEvaluationModelFactory } from 'src/engine/metadata-modules/ai/ai-models/utils/get-evaluation-model-factory.util';
 import { getTranscriptionModelFactory } from 'src/engine/metadata-modules/ai/ai-models/utils/get-transcription-model-factory.util';
+
+// ---------------------------------------------------------------------------
+// LOCAL PATCH: per-conversation `x-opencode-session` header
+//
+// OpenCode Go (https://opencode.ai/zen/go/v1) rejects any inference request that
+// does not carry an `x-opencode-session` header. The Vercel AI SDK never sends
+// it, and upstream declined to add vendor-specific header injection
+// (twentyhq/twenty#25289 closed unmerged), so the header is derived here from
+// the outgoing request body instead: sha256(system prompt + first user turn)
+// formatted as a UUID. Stable across the turns of one conversation, distinct
+// between conversations, opaque to OpenCode.
+//
+// Attached ONLY when the provider baseUrl points at opencode.ai: every other
+// vendor's request is byte-for-byte unchanged, which is exactly what upstream's
+// objection to the PR was about.
+//
+// See PATCHES.md. Retire this block once upstream passes custom provider
+// headers through to the SDK, or once OpenCode Go stops requiring the header.
+// ---------------------------------------------------------------------------
+const OPENCODE_SESSION_HEADER = 'x-opencode-session';
+
+const OPENCODE_BASE_URL_PATTERN = /(^|[./])opencode\.ai([/:]|$)/;
+
+const isOpencodeBaseUrl = (baseUrl?: string): boolean =>
+  typeof baseUrl === 'string' && OPENCODE_BASE_URL_PATTERN.test(baseUrl);
+
+const opencodeSessionIdFromBody = (body: unknown): string => {
+  let seed: string | null = null;
+
+  if (typeof body === 'string' && body.length > 0) {
+    try {
+      const parsed = JSON.parse(body) as
+        | { messages?: Array<{ role?: string; content?: unknown }> }
+        | Array<{ role?: string; content?: unknown }>;
+      const messages = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.messages)
+          ? parsed.messages
+          : null;
+
+      if (messages && messages.length > 0) {
+        const systemMessage = messages.find((m) => m?.role === 'system');
+        const firstUserMessage = messages.find((m) => m?.role === 'user');
+
+        seed = JSON.stringify([
+          systemMessage?.content ?? null,
+          firstUserMessage?.content ?? null,
+        ]);
+      }
+    } catch {
+      // Body is not JSON: fall through and hash the raw body.
+    }
+
+    if (seed === null) {
+      seed = body;
+    }
+  }
+
+  const hex = createHash('sha256')
+    .update(seed ?? randomUUID())
+    .digest('hex')
+    .slice(0, 32);
+
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join('-');
+};
+
+const withOpencodeSession = <T extends (...args: any[]) => any>(
+  config: AiProviderConfig,
+  factory: T,
+): T => {
+  if (!isOpencodeBaseUrl(config?.baseUrl)) {
+    return factory;
+  }
+
+  return ((settings: Record<string, any>) => {
+    const innerFetch = settings?.fetch ?? globalThis.fetch;
+
+    return factory({
+      ...settings,
+      fetch: async (input: any, init: any) => {
+        const headers = new Headers(init?.headers);
+
+        if (!headers.has(OPENCODE_SESSION_HEADER)) {
+          headers.set(
+            OPENCODE_SESSION_HEADER,
+            opencodeSessionIdFromBody(init?.body),
+          );
+        }
+
+        return innerFetch(input, { ...init, headers });
+      },
+    });
+  }) as unknown as T;
+};
+// ------------------------ end of local patch ------------------------------
 
 export type AiSdkProviderInstance = {
   // Absent on providers that serve no language model at all, such as an
@@ -153,7 +256,7 @@ export class SdkProviderFactoryService {
     factory: (opts: { apiKey?: string; baseURL?: string }) => CallableFunction,
     options?: { middleware?: LanguageModelMiddleware },
   ): AiSdkProviderInstance {
-    const provider = factory({
+    const provider = withOpencodeSession(config, factory)({
       ...(config.apiKey && { apiKey: config.apiKey }),
       ...(config.baseUrl && { baseURL: config.baseUrl }),
     });
@@ -168,7 +271,7 @@ export class SdkProviderFactoryService {
   }
 
   private buildXaiProvider(config: AiProviderConfig): AiSdkProviderInstance {
-    const provider = createXai({
+    const provider = withOpencodeSession(config, createXai)({
       ...(config.apiKey && { apiKey: config.apiKey }),
       ...(config.baseUrl && { baseURL: config.baseUrl }),
     });
@@ -187,7 +290,7 @@ export class SdkProviderFactoryService {
       ? fromNodeProviderChain({ clientConfig: { region } })
       : undefined;
 
-    const provider = createAmazonBedrock({
+    const provider = withOpencodeSession(config, createAmazonBedrock)({
       region,
       ...(awsCredentialProvider && {
         credentialProvider: async () => {
@@ -223,7 +326,7 @@ export class SdkProviderFactoryService {
       throw new Error('baseUrl is required for openai-compatible providers');
     }
 
-    const provider = createOpenAICompatible({
+    const provider = withOpencodeSession(config, createOpenAICompatible)({
       name: config.name ?? 'openai-compatible',
       baseURL: config.baseUrl,
       ...(config.apiKey && { apiKey: config.apiKey }),
@@ -254,7 +357,7 @@ export class SdkProviderFactoryService {
       throw new Error('baseUrl is required for Azure OpenAI providers');
     }
 
-    const provider = createAzure({
+    const provider = withOpencodeSession(config, createAzure)({
       baseURL: config.baseUrl,
       ...(config.apiKey && { apiKey: config.apiKey }),
     });
