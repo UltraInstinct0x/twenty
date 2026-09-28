@@ -1,0 +1,23 @@
+# Build a drop-in replacement image: the pinned official Twenty image with ONE
+# compiled file swapped for the generated patched version.
+#
+# Usage (scripts/update-twenty.sh does exactly this):
+#   docker build -f patches/opencode-session/Dockerfile.patched \
+#     --build-arg BASE_IMAGE=twentycrm/twenty:v2.43.0@sha256:<digest> \
+#     --build-arg PATCH_REVISION=<sha256 of the generated file> \
+#     -t twentycrm/twenty:goku-v2.43.0-p1 <staging-dir>
+#
+# The staging dir must contain `sdk-provider-factory.service.js` (the output of
+# generate-dist-patch.py). Server and worker run the same image, so one build
+# covers both.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG PATCH_REVISION=unknown
+
+LABEL goku.patch="opencode-session" \
+      goku.patch.revision="${PATCH_REVISION}" \
+      goku.patch.base="${BASE_IMAGE}"
+
+COPY --chown=1000:1000 sdk-provider-factory.service.js \
+     /app/packages/twenty-server/dist/engine/metadata-modules/ai/ai-models/services/sdk-provider-factory.service.js
