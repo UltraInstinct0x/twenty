@@ -53,8 +53,22 @@ info "$SERVER restart count: $restarts (1 is normal after a boot/recreate)"
 echo "-- http --"
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$HEALTH_URL" || echo 000)"
 [ "$code" = 200 ] && ok "local /healthz 200" || bad "local /healthz returned $code"
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$PUBLIC_URL/" || echo 000)"
-[ "$code" = 200 ] && ok "public $PUBLIC_URL 200" || bad "public $PUBLIC_URL returned $code"
+# twenty >= v2.43 serves the SPA only to document requests: FrontendService.serveDocument
+# -> isFrontendDocumentRequest requires request.accepts() to include text/html. A bare
+# `curl /` accepts */* and gets a 404 from express, which is NOT a health problem.
+# So send browser-like headers, and retry: FrontendModule mounts its middleware in
+# onModuleInit, i.e. healthz can answer 200 a few seconds before / serves html.
+BROWSER_ARGS=(-H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+              -H 'Sec-Fetch-Dest: document' -H 'Sec-Fetch-Mode: navigate'
+              -H 'User-Agent: Mozilla/5.0 (twenty-smoke-test)')
+code=000
+for _ in $(seq 1 12); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${BROWSER_ARGS[@]}" "$PUBLIC_URL/" || echo 000)"
+  [ "$code" = 200 ] && break
+  sleep 10
+done
+[ "$code" = 200 ] && ok "public $PUBLIC_URL 200 (browser-like document request)" \
+  || bad "public $PUBLIC_URL returned $code to a browser-like document request"
 
 echo "-- live version --"
 live="$(curl -s --max-time 20 "$PUBLIC_URL/client-config" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("appVersion",""))' 2>/dev/null)"
